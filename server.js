@@ -20,6 +20,19 @@ const REGION = process.env.REGION; // e.g. 'us-central1'
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const run = google.run('v2'); // Cloud Run API
 
+// --- Discord Client ---
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+});
+
+client.once('ready', () => {
+    console.log(`Logged in as ${client.user.tag}`);
+});
+
 // State
 const activeSessions = new Map(); // channelId -> sessionId
 
