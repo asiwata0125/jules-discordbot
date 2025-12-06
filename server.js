@@ -243,7 +243,7 @@ app.post('/interactions', async (req, res) => {
 
     if (message.type === InteractionType.PING) {
         console.log("Handling PING. Sending PONG.");
-        return res.send({ type: InteractionResponseType.PONG });
+        return res.status(200).json({ type: 1 }); // Hardcoded type 1 (PONG) and explicit JSON
     }
 
     if (message.type === InteractionType.APPLICATION_COMMAND) {
@@ -251,16 +251,23 @@ app.post('/interactions', async (req, res) => {
 
         if (commandName === 'wake') {
             console.log("Received /wake command");
-            res.send({
+            // Reply should use res.json for clarity, though res.send works
+            res.json({
                 type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
                 data: {
                     content: '🥱 Waking up... (This will take about a minute. I will start listening to chat soon!)',
-                    flags: 64 
+                    flags: 64 // Ephemeral
                 }
             });
             
-            await GoogleCloudManager.setMinInstances(1);
+            // Trigger Scaling
+            // ... (scaling logic) 
+            // Better to trigger async to not block response? Discord has 3s timeout.
+            // But basic response is fast.
+            
+            GoogleCloudManager.setMinInstances(1).catch(console.error);
 
+            // Connect Gateway
             if (!client.isReady()) {
                 console.log("Logging in to Discord Gateway...");
                 client.login(DISCORD_TOKEN).catch(console.error);
@@ -270,19 +277,20 @@ app.post('/interactions', async (req, res) => {
 
         if (commandName === 'sleep') {
             console.log("Received /sleep command");
-            res.send({
+            res.json({
                 type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
                 data: {
                     content: '😴 Going to sleep... Goodnight!',
-                    flags: 64 
+                    flags: 64 // Ephemeral
                 }
             });
 
-            await GoogleCloudManager.setMinInstances(0);
+            GoogleCloudManager.setMinInstances(0).catch(console.error);
             return;
         }
     }
     console.log("Unknown interaction type");
+    res.status(400).send("Unknown Type");
 });
 
 // Health Check
