@@ -120,6 +120,75 @@ async function sendMessageToSession(sessionId, message) {
     return response.json();
 }
 
+async function listActivities(sessionId) {
+    const response = await fetch(`${JULES_BASE_URL}/${sessionId}/activities?pageSize=10`, { // Fetch recent
+        headers: {
+            'X-Goog-Api-Key': JULES_API_KEY
+        }
+    });
+
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Failed to list activities: ${response.status} ${text}`);
+    }
+    return response.json();
+}
+
+// Track last seen activity ID per channel/session to avoid duplicates
+const lastSeenActivityIds = new Map(); // channelId -> activityIdString
+
+async function waitForAgentResponse(sessionId, channelId) {
+    const maxRetries = 15; // Wait up to ~30 seconds (15 * 2s)
+    const interval = 2000;
+
+    for (let i = 0; i < maxRetries; i++) {
+        await new Promise(resolve => setTimeout(resolve, interval));
+        console.log(`Polling activities for ${sessionId}... attempt ${i+1}`);
+
+        const data = await listActivities(sessionId);
+        if (!data.activities || data.activities.length === 0) continue;
+
+        // Sort by createTime? API usually returns ordered? 
+        // Docs don't specify sort order clearly, but seemingly chronological or reverse.
+        // Let's assume the API returns list, we probably want the *latest* 'agent' activity.
+        // We filter for originator == 'agent'.
+        
+        const agentActivities = data.activities.filter(a => a.originator === 'agent');
+        
+        if (agentActivities.length === 0) continue;
+
+        // Look for the most recent one we haven't seen.
+        // We'll trust the order in the list or check createTime if needed.
+        // Let's assume index 0 is newest or check timestamps. 
+        // Ideally we parse createTime.
+        agentActivities.sort((a, b) => new Date(b.createTime) - new Date(a.createTime)); // Descending
+
+        const latestActivity = agentActivities[0];
+        
+        const lastSeenId = lastSeenActivityIds.get(channelId);
+        
+        if (latestActivity.id !== lastSeenId) {
+            // New activity found!
+            lastSeenActivityIds.set(channelId, latestActivity.id);
+            
+            // Extract text
+            let text = "";
+            if (latestActivity.progressUpdated) {
+                text = latestActivity.progressUpdated.description || latestActivity.progressUpdated.title;
+            } else if (latestActivity.planGenerated) {
+                text = "I've generated a plan: " + (latestActivity.planGenerated.plan.steps.map(s => s.title).join('\n') || "Check the dashboard.");
+            } else if (latestActivity.sessionCompleted) {
+                text = "Session completed.";
+            } else {
+                continue; // Skip activities with no displayable text (like strict internal ones?)
+            }
+
+            if (text) return text;
+        }
+    }
+    return null; // Timeout
+}
+
 // --- Discord Client ---
 
 const client = new Client({
@@ -229,23 +298,22 @@ client.on('messageCreate', async (message) => {
             activeSessions.set(channelId, sessionId);
             
             // Now send the actual user message
-            const msgResponse = await sendMessageToSession(sessionId, content);
-            // We need to parse the response from msgResponse.
-            // If msgResponse contains the answer, great.
-            // If it's async, we might need to poll `ListActivities`.
-            // Given "asynchronous coding tasks", polling `ListActivities` is likely.
-            // But for a chat bot, we hope for synchronous-ish behavior.
+            await sendMessageToSession(sessionId, content);
             
-            // Simplification: Just dump what we get back for now to debug, 
-            // or better, implement a `getLastAgentMessage` helper.
-            
-            replyText = `Session started with source ${source.name}. (Check logs for API response)`;
-            // NOTE: We will likely need to refine this reading part after testing.
-            
+            // Poll for response
+            replyText = await waitForAgentResponse(sessionId, channelId);
+
         } else {
             // Existing session
-            const responseData = await sendMessageToSession(sessionId, content);
-            replyText = "Message sent. (Response parsing TBD)";
+            await sendMessageToSession(sessionId, content);
+            replyText = await waitForAgentResponse(sessionId, channelId);
+        }
+
+        if (replyText) {
+            await message.reply(replyText);
+        } else {
+            // Fallback if timeout
+            await message.channel.send("Jules is thinking... (Response timed out, check back later)");
         }
 
         // Try to find the actual text in the response (optimistic guess on structure)
