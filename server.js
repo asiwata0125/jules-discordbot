@@ -251,43 +251,45 @@ client.on('messageCreate', async (message) => {
             // 3. Create Session
             // Use the user's message as the initial prompt
             const sessionData = await createSessionFull(source, content);
+            console.log("Session Created:", JSON.stringify(sessionData));
+            
             sessionId = sessionData.name; // "sessions/..."
+            if (!sessionId) {
+                throw new Error("Session ID is missing in response: " + JSON.stringify(sessionData));
+            }
             activeSessions.set(channelId, sessionId);
             
-            // The creation response might contain the first answer? 
-            // Docs say: "The immediate response will look something like this... prompt: 'Create a boba app!'"
-            // It doesn't seem to return the *agent's text response* immediately in the session object, 
-            // it usually returns the session metadata.
-            // We usually need to list activities or wait for an event?
-            // Actually, usually `sendMessage` returns the response.
-            // `createSession` just initializes.
+            // Now send the actual user message
+            await sendMessageToSession(sessionId, content);
             
-            // If createSession doesn't trigger a turn, we might need to send the message again?
-            // But we passed the prompt in createSession.
-            // Let's check if we need to fetch the initial response.
-            // The `outputs` field in session object might have something?
-            // Or maybe we treat the first message as "Context setting" and just say "Session started".
-            // Let's try to `sendMessage` immediately if the creation prompt implies a question.
-            
-            // Actually, for a chat bot, we usually want:
-            // User: "Hi" -> Create Session -> Bot: "Hi, how can I help?"
-            // If we use "Hi" as the prompt for creation, the agent "processes" it.
-            // We need to get the agent's reply.
-            // Does `createSession` return the activities/activities list?
-            // Probably not.
-            
-            // Strategy: 
-            // 1. Create session with prompt.
-            // 2. Wait a moment? Or List Activities?
-            // The docs for `sendMessage` say it returns the response? No, it returns the user message resource usually?
-            // "Here is an example of a ListActivities response." -> implies we might need to poll or list activities.
-            
-            // WAIT. `sendMessage` documentation isn't fully shown in the chunks I read.
-            // Let's assume we need to list activities to get the response, OR `sendMessage` returns it.
-            // Most Google Agent APIs (like Vertex AI) return the response in the call.
-            // But this might be async.
-            // Let's assume we need to `sendMessage` to *talk*.
-            // If `createSession` takes a prompt, that's just the 'task description'.
+            // Poll for response
+            replyText = await waitForAgentResponse(sessionId, channelId);
+
+        } else {
+            // Existing session
+            console.log(`Using existing session ${sessionId}`);
+            try {
+                await sendMessageToSession(sessionId, content);
+                replyText = await waitForAgentResponse(sessionId, channelId);
+            } catch (err) {
+                 if (err.message.includes('404')) {
+                    console.log("Session 404, clearing and retrying...");
+                    activeSessions.delete(channelId);
+                    await message.reply("Previous session expired. Starting a new one...");
+                    return;
+                }
+                throw err;
+            }
+        }
+
+        if (replyText) {
+            await message.reply(replyText);
+        } else {
+            await message.channel.send("Jules is thinking... (Response timed out, check back later)");
+        }
+
+    } catch (err) {
+        console.error("Handler Error:", err);
         await message.reply(`Error: ${err.message}`);
     }
 });
