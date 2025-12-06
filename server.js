@@ -267,26 +267,50 @@ app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, 
 
         if (commandName === 'wake') {
             console.log("Received /wake command");
+            const channelId = message.channel_id;
+
             // Reply should use res.json for clarity, though res.send works
             res.json({
                 type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
                 data: {
                     content: '🥱 Waking up... (This will take about a minute. I will start listening to chat soon!)',
-                    flags: 64 // Ephemeral
                 }
             });
-            
-            // Trigger Scaling
-            // ... (scaling logic) 
-            // Better to trigger async to not block response? Discord has 3s timeout.
-            // But basic response is fast.
             
             GoogleCloudManager.setMinInstances(1).catch(console.error);
 
             // Connect Gateway
             if (!client.isReady()) {
                 console.log("Logging in to Discord Gateway...");
-                client.login(DISCORD_TOKEN).catch(console.error);
+                
+                // Notify when actually ready
+                const onReady = async () => {
+                   try {
+                       const channel = await client.channels.fetch(channelId);
+                       if (channel) {
+                           await channel.send("✨ I am fully awake and ready to chat! (Model: gemini-2.5-flash)");
+                       }
+                   } catch (err) {
+                       console.error("Failed to send ready message:", err);
+                   }
+                };
+                client.once('ready', onReady);
+
+                client.login(DISCORD_TOKEN).catch(err => {
+                    console.error("Login failed:", err);
+                    client.off('ready', onReady);
+                });
+            } else {
+                 // If already ready, maybe send a follow up immediately? 
+                 // Or just assume the user knows.
+                 // Ideally use followUp via interaction token, but standard message is fine if we have channelId.
+                 try {
+                     // Wait a bit to let the first message appear
+                     setTimeout(async () => {
+                        const channel = await client.channels.fetch(channelId);
+                        if (channel) await channel.send("✨ I was already awake! Ready to chat.");
+                     }, 1000);
+                 } catch(e) {}
             }
             return;
         }
