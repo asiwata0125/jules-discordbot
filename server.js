@@ -2,15 +2,159 @@ require('dotenv').config();
 const { Client, GatewayIntentBits } = require('discord.js');
 const express = require('express');
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { google } = require('googleapis'); // NEW
+const { verifyKeyMiddleware, InteractionType, InteractionResponseType } = require('discord-interactions'); // NEW
 
 // Configuration
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080; // Cloud Run default
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-
-// ... (Configuration)
+const JULES_API_KEY = process.env.JULES_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY; // Needed for interactions
+
+const PROJECT_ID = process.env.PROJECT_ID; // e.g. 'my-project'
+const SERVICE_NAME = process.env.SERVICE_NAME; // e.g. 'jules-bot'
+const REGION = process.env.REGION; // e.g. 'us-central1'
+
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const run = google.run('v2'); // Cloud Run API
+
+// State
+const activeSessions = new Map(); // channelId -> sessionId
+
+// --- Google Cloud Run Manager ---
+class GoogleCloudManager {
+    static async getAuthClient() {
+        const auth = new google.auth.GoogleAuth({
+            scopes: ['https://www.googleapis.com/auth/cloud-platform']
+        });
+        return await auth.getClient();
+    }
+
+    static async setMinInstances(count) {
+        if (!PROJECT_ID || !SERVICE_NAME || !REGION) {
+            console.log("Cloud Run env vars missing, skipping scaling.");
+            return;
+        }
+
+        console.log(`Setting min-instances to ${count}...`);
+        try {
+            const authClient = await this.getAuthClient();
+            const name = `projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE_NAME}`;
+            
+            // 1. Get current config to preserve other settings
+            const request = {
+                name,
+                auth: authClient
+            };
+            // Note: In v2 API, we patch the service.
+            // We need to construct the patch request carefully.
+            
+            // Simplified: We assume we just want to update scaling. 
+            // We use the `updateService` method, but typically needs the full object or a mask.
+            // Let's use `patch` with updateMask.
+            
+            const patchRequest = {
+                name,
+                updateMask: 'template.scaling.minInstanceCount',
+                requestBody: {
+                    template: {
+                        scaling: {
+                            minInstanceCount: count
+                        }
+                    }
+                },
+                auth: authClient
+            };
+
+            await run.projects.locations.services.patch(patchRequest);
+            console.log(`Successfully set min-instances to ${count}`);
+
+        } catch (err) {
+            console.error("Failed to scale Cloud Run:", err);
+            // Don't crash app, just log
+        }
+    }
+}
+
+// ... (Jules API Helpers source helpers logic remains same, removed for brevity in this replace call, will keep if I don't touch them? 
+// Wait, I must be careful not to delete them. I will use Start/End line to preserve them.)
+
+// ...
+
+// --- Express Server & Interactions ---
+const app = express();
+
+// Interaction Endpoint (Slash Commands)
+app.post('/interactions', verifyKeyMiddleware(DISCORD_PUBLIC_KEY), async (req, res) => {
+    const message = req.body;
+
+    if (message.type === InteractionType.PING) {
+        return res.send({ type: InteractionResponseType.PONG });
+    }
+
+    if (message.type === InteractionType.APPLICATION_COMMAND) {
+        const commandName = message.data.name;
+
+        if (commandName === 'wake') {
+            console.log("Received /wake command");
+            res.send({
+                type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                data: {
+                    content: '🥱 Waking up... (This will take about a minute. I will start listening to chat soon!)',
+                    flags: 64 // Ephemeral
+                }
+            });
+            
+            // Trigger Scaling
+            await GoogleCloudManager.setMinInstances(1);
+
+            // Connect Gateway
+            if (!client.isReady()) {
+                console.log("Logging in to Discord Gateway...");
+                client.login(DISCORD_TOKEN).catch(console.error);
+            }
+            return;
+        }
+
+        if (commandName === 'sleep') {
+            console.log("Received /sleep command");
+            res.send({
+                type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                data: {
+                    content: '😴 Going to sleep... Goodnight!',
+                    flags: 64 // Ephemeral
+                }
+            });
+
+            // Trigger Sleep Logic
+            await GoogleCloudManager.setMinInstances(0);
+            
+            // Optional: Destroy client connection to ensure process can idle out if Cloud Run logic permits
+            // client.destroy(); 
+            return;
+        }
+    }
+});
+
+// Health Check
+app.get('/', (req, res) => {
+    res.send({ status: 'running', bot_ready: client.isReady() });
+});
+
+app.listen(PORT, () => {
+    console.log(`Express server running on port ${PORT}`);
+});
+
+
+
+// Note: We need to preserve the Jules helpers and Client logic.
+// I will target the TOP of the file to inject imports/config/classes,
+// and the BOTTOM to inject the Express listeners.
+
+// This tool call REPLACES imports and config.
+
 
 // ... (Jules API Helpers source helpers remain the same ...)
 
@@ -141,4 +285,4 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-client.login(DISCORD_TOKEN);
+
