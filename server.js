@@ -103,7 +103,7 @@ async function createSessionFull(source, userPrompt) {
             prompt: userPrompt,
             sourceContext: {
                 source: source.name,
-                githubRepoContext: source.githubRepo ? { startingBranch: "main" } : undefined
+                githubRepoContext: source.githubRepo ? {} : undefined
             },
             automationMode: "AUTO_CREATE_PR",
             requirePlanApproval: true
