@@ -104,7 +104,9 @@ async function createSessionFull(sourceObj, prompt) {
 }
 
 async function sendMessageToSession(sessionId, message) {
-    const response = await fetch(`${JULES_BASE_URL}/${sessionId}:sendMessage`, {
+    const url = `${JULES_BASE_URL}/${sessionId}:sendMessage`;
+    console.log(`POSTing to ${url}`);
+    const response = await fetch(url, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -286,44 +288,6 @@ client.on('messageCreate', async (message) => {
             // But this might be async.
             // Let's assume we need to `sendMessage` to *talk*.
             // If `createSession` takes a prompt, that's just the 'task description'.
-            // So: Create Session (task="User's initial intent") -> Then Send Message ("Actually, user just said Hi")?
-            // Maybe we should Create Session with a GENERIC prompt "Assistant Session", and then Send the User's actual message?
-            
-            // Let's try that approach:
-            // 1. Create Session with prompt="Help the user with their code."
-            // 2. Send Message(userContent).
-            
-            const initSession = await createSessionFull(source, "Help the user with their code.");
-            sessionId = initSession.name;
-            activeSessions.set(channelId, sessionId);
-            
-            // Now send the actual user message
-            await sendMessageToSession(sessionId, content);
-            
-            // Poll for response
-            replyText = await waitForAgentResponse(sessionId, channelId);
-
-        } else {
-            // Existing session
-            await sendMessageToSession(sessionId, content);
-            replyText = await waitForAgentResponse(sessionId, channelId);
-        }
-
-        if (replyText) {
-            await message.reply(replyText);
-        } else {
-            // Fallback if timeout
-            await message.channel.send("Jules is thinking... (Response timed out, check back later)");
-        }
-
-        // Try to find the actual text in the response (optimistic guess on structure)
-        // If the response contains `activities`, we grab the last one.
-        // If not, we reply with the generic confirm.
-        
-        await message.reply(replyText);
-
-    } catch (err) {
-        console.error(err);
         await message.reply(`Error: ${err.message}`);
     }
 });
