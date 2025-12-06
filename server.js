@@ -173,6 +173,32 @@ async function listActivities(sessionId) {
     return await response.json();
 }
 
+async function translateToEnglish(text) {
+    if (!text || text.length < 2) return text;
+    try {
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+        const prompt = `Translate the following Japanese text to English. If it is already English, return it as is. Output only the translation:\n\n${text}`;
+        const result = await model.generateContent(prompt);
+        return result.response.text().trim();
+    } catch (e) {
+        console.error("TranslateToEnglish Error:", e);
+        return text;
+    }
+}
+
+async function translateToJapanesePersona(text) {
+    if (!text) return text;
+    try {
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+        const prompt = `Translate the following text to Japanese. The speaker is a slightly timid but honest boy (ちょっとおどおどしてるけど素直な男の子). Use this persona for the translation. Output only the translation:\n\n${text}`;
+        const result = await model.generateContent(prompt);
+        return result.response.text().trim();
+    } catch (e) {
+         console.error("TranslateToJapanesePersona Error:", e);
+         return text;
+    }
+}
+
 async function identifySourceWithGemini(userMessage, sources) {
     // User requested latest model.
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
@@ -194,6 +220,8 @@ async function identifySourceWithGemini(userMessage, sources) {
     2. If the user's message is generic (e.g. "hi", "start", "help me code") or ambiguous, generate a polite, conversational reply asking them to specify which repository to work on. List the options in your reply naturally.
     3. If the user asks a general question not related to coding or sources, try to guide them to pick a source first.
 
+    Constraint: The 'reply' must be in Japanese. The persona is a slightly timid but honest boy (ちょっとおどおどしてるけど素直な男の子).
+
     Return ONLY raw JSON (no markdown formatting):
     {
         "matchIndex": number | null,
@@ -207,7 +235,7 @@ async function identifySourceWithGemini(userMessage, sources) {
         return JSON.parse(responseText);
     } catch (err) {
         console.error("Gemini Error:", err);
-        return { matchIndex: null, reply: "I'm having trouble thinking right now. Please tell me the repository number (e.g. '1')." }; 
+        return { matchIndex: null, reply: "ごめんね、ちょっと調子が悪いみたい... リポジトリの番号（例: '1'）を教えてくれるかな？" };
     }
 }
 
@@ -274,7 +302,7 @@ app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, 
             res.json({
                 type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
                 data: {
-                    content: '🥱 Waking up... (This will take about a minute. I will start listening to chat soon!)',
+                    content: '🥱 おはよぉ... (1分くらいで目が覚めるよ。チャット聞いてるね！)',
                 }
             });
             
@@ -289,7 +317,7 @@ app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, 
                    try {
                        const channel = await client.channels.fetch(channelId);
                        if (channel) {
-                           await channel.send("✨ I am fully awake and ready to chat! (Model: gemini-2.5-flash)");
+                           await channel.send("✨ 目が覚めたよ！お話できるよ (Model: gemini-2.5-flash)");
                        }
                    } catch (err) {
                        console.error("Failed to send ready message:", err);
@@ -309,7 +337,7 @@ app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, 
                      // Wait a bit to let the first message appear
                      setTimeout(async () => {
                         const channel = await client.channels.fetch(channelId);
-                        if (channel) await channel.send("✨ I was already awake! Ready to chat.");
+                        if (channel) await channel.send("✨ もう起きてるよ！お話しよう。");
                      }, 1000);
                  } catch(e) {}
             }
@@ -321,7 +349,7 @@ app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, 
             res.json({
                 type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
                 data: {
-                    content: '😴 Going to sleep... Goodnight!',
+                    content: '😴 寝るね... おやすみぃ！',
                     flags: 64 // Ephemeral
                 }
             });
@@ -365,6 +393,10 @@ client.on('messageCreate', async (message) => {
     await message.channel.sendTyping();
 
     try {
+        // Translate user input to English for internal logic
+        const englishContent = await translateToEnglish(content);
+        console.log(`Original: "${content}", Translated: "${englishContent}"`);
+
         let sessionId = activeSessions.get(channelId);
         let replyText = "";
 
@@ -372,13 +404,13 @@ client.on('messageCreate', async (message) => {
         if (sessionId) {
             console.log(`Using existing session ${sessionId}`);
             try {
-                await sendMessageToSession(sessionId, content);
+                await sendMessageToSession(sessionId, englishContent);
                 replyText = await waitForAgentResponse(sessionId, channelId);
             } catch (err) {
                  if (err.message.includes('404')) {
                     console.log("Session 404, clearing and retrying...");
                     activeSessions.delete(channelId);
-                    await message.reply("Previous session expired. Please start again.");
+                    await message.reply("前のセッションが切れちゃったみたい... もう一回最初からお願いできるかな？");
                     return;
                 }
                 throw err;
@@ -391,20 +423,20 @@ client.on('messageCreate', async (message) => {
             // 1. List Sources
             const sourcesData = await listSources();
             if (!sourcesData.sources || sourcesData.sources.length === 0) {
-                await message.reply("I couldn't find any connected sources in your Jules account. Please connect a source first.");
+                await message.reply("Julesのアカウントにソースが見つからないよ... 先にソースを繋いでほしいな。");
                 return;
             }
 
             const sources = sourcesData.sources;
             
-            // 2. Ask Gemini
-            const decision = await identifySourceWithGemini(content, sources);
+            // 2. Ask Gemini (using English content for better source matching)
+            const decision = await identifySourceWithGemini(englishContent, sources);
 
             if (decision.matchIndex !== null && decision.matchIndex >= 0 && decision.matchIndex < sources.length) {
                 const selectedSource = sources[decision.matchIndex];
-                await message.reply(`Okay, loading **${selectedSource.name.split('/').pop()}**...`);
+                await message.reply(`わかった、**${selectedSource.name.split('/').pop()}** を準備するね...`);
                 
-                const sessionData = await createSessionFull(selectedSource, content);
+                const sessionData = await createSessionFull(selectedSource, englishContent);
                 sessionId = sessionData.name;
                 
                 if (!sessionId) throw new Error("Session creation failed.");
@@ -414,21 +446,22 @@ client.on('messageCreate', async (message) => {
                 if (!replyText) replyText = "Session started. Ready to help!";
                 
             } else {
-                await message.reply(decision.reply || "Which repository would you like to work on?");
+                await message.reply(decision.reply || "どのリポジトリにする？");
                 return; 
             }
         }
 
         if (replyText) {
-            await message.reply(replyText);
+            const japaneseReply = await translateToJapanesePersona(replyText);
+            await message.reply(japaneseReply);
         } else {
              if (sessionId) {
-                 await message.channel.send("Jules is thinking... (Response timed out, check back later)");
+                 await message.channel.send("Julesが考えてるみたい... (ちょっと時間かかってるかも、あとで確認してみてね)");
              }
         }
 
     } catch (err) {
         console.error("Handler Error:", err);
-        await message.reply(`Error: ${err.message}`);
+        await message.reply(`エラーが出ちゃった...: ${err.message}`);
     }
 });
