@@ -178,7 +178,8 @@ async function identifySourceWithGemini(userMessage, sources) {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     
     // Create a simplified list of sources for the prompt
-    
+    const sourcesList = sources.map((s, i) => `${i}. ${s.name} (Repo: ${s.githubRepo?.owner}/${s.githubRepo?.name})`).join('\n');
+
     const prompt = `
     You are a setup assistant for a coding bot. 
     The user wants to start a session but needs to select a source repository first.
@@ -300,6 +301,12 @@ app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, 
                     flags: 64 // Ephemeral
                 }
             });
+
+            // Disconnect Gateway
+            if (client.isReady()) {
+                 console.log("Destroying client connection...");
+                 client.destroy();
+            }
 
             GoogleCloudManager.setMinInstances(0).catch(console.error);
             return;
