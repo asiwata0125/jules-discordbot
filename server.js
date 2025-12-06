@@ -8,10 +8,10 @@ const { verifyKey, InteractionType, InteractionResponseType } = require('discord
 
 // Configuration
 const PORT = process.env.PORT || 8080;
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const JULES_API_KEY = process.env.JULES_API_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN ? process.env.DISCORD_TOKEN.trim() : "";
+const JULES_API_KEY = process.env.JULES_API_KEY ? process.env.JULES_API_KEY.trim() : "";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : "";
+const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY ? process.env.DISCORD_PUBLIC_KEY.trim() : "";
 const PROJECT_ID = process.env.PROJECT_ID;
 const SERVICE_NAME = process.env.SERVICE_NAME;
 const REGION = process.env.REGION;
@@ -228,13 +228,12 @@ app.use(express.json({
         if (signature && timestamp) {
             const isValidRequest = verifyKey(buf, signature, timestamp, DISCORD_PUBLIC_KEY);
             console.log("Signature Verification Result:", isValidRequest);
-            
-            // TEMPORARY DEBUG: Allow request even if verification fails
-            // if (!isValidRequest) {
-            //    console.error("Signature verification failed.");
-            //    res.status(401).send('Bad Request Signature');
-            //    throw new Error('Bad Request Signature');
-            // }
+
+            if (!isValidRequest) {
+               console.error("Signature verification failed.");
+               res.status(401).send('Bad Request Signature');
+               throw new Error('Bad Request Signature');
+            }
         }
     }
 }));
@@ -246,7 +245,8 @@ app.post('/interactions', async (req, res) => {
 
     if (message.type === InteractionType.PING) {
         console.log("Handling PING. Sending PONG.");
-        return res.status(200).json({ type: 1 }); // Hardcoded type 1 (PONG) and explicit JSON
+        res.setHeader('Content-Type', 'application/json');
+        return res.status(200).send(JSON.stringify({ type: 1 }));
     }
 
     if (message.type === InteractionType.APPLICATION_COMMAND) {
