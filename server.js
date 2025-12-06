@@ -174,9 +174,10 @@ async function listActivities(sessionId) {
 }
 
 async function identifySourceWithGemini(userMessage, sources) {
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    // User requested latest model.
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     
-    const sourcesList = sources.map((s, i) => `${i + 1}. ${s.githubRepo ? `${s.githubRepo.owner}/${s.githubRepo.repo}` : s.name}`).join('\n');
+    // Create a simplified list of sources for the prompt
     
     const prompt = `
     You are a setup assistant for a coding bot. 
