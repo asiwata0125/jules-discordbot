@@ -230,12 +230,73 @@ client.on('messageCreate', async (message) => {
     // Indicate typing
     await message.channel.sendTyping();
 
+const pendingSourceSelections = new Map(); // channelId -> { sources: [], originalPrompt: string }
+
     try {
         let sessionId = activeSessions.get(channelId);
+        let pendingSelection = pendingSourceSelections.get(channelId);
         let replyText = "";
 
-        if (!sessionId) {
-            console.log(`No active session for channel ${channelId}. Creating new one.`);
+        // Case 1: Active Session exists -> Continue chat
+        if (sessionId) {
+            console.log(`Using existing session ${sessionId}`);
+            try {
+                // If it's a "reset" command, maybe handle that? (Future work)
+                await sendMessageToSession(sessionId, content);
+                replyText = await waitForAgentResponse(sessionId, channelId);
+            } catch (err) {
+                 if (err.message.includes('404')) {
+                    console.log("Session 404, clearing and retrying...");
+                    activeSessions.delete(channelId);
+                    await message.reply("Previous session expired. Please start again.");
+                    return;
+                }
+                throw err;
+            }
+        
+        // Case 2: Pending Source Selection -> Handle User Choice
+        } else if (pendingSelection) {
+            const choice = parseInt(content.trim());
+            const sources = pendingSelection.sources;
+
+            if (isNaN(choice) || choice < 1 || choice > sources.length) {
+                await message.reply(`Please enter a number between 1 and ${sources.length}.`);
+                return;
+            }
+
+            const selectedSource = sources[choice - 1];
+            const originalPrompt = pendingSelection.originalPrompt;
+
+            // Clear pending state
+            pendingSourceSelections.delete(channelId);
+
+            await message.reply(`Project **${selectedSource.name.split('/').pop()}** selected. Initializing session...`);
+
+            // Create Session using the ORIGINAL prompt
+            const sessionData = await createSessionFull(selectedSource, originalPrompt);
+            console.log("Session Created:", JSON.stringify(sessionData));
+            
+            sessionId = sessionData.name;
+             if (!sessionId) {
+                throw new Error("Session ID is missing in response.");
+            }
+            activeSessions.set(channelId, sessionId);
+
+            // Wait for response (assuming the creation prompt triggers the first thought)
+            // If createSession uses 'prompt' to START, does it create an 'agent' activity?
+            // Usually yes.
+            replyText = await waitForAgentResponse(sessionId, channelId);
+
+            // If no immediate response from creation, we might need to send the prompt again?
+            // But we just sent it.
+            // Let's rely on polling. If return null, we say "Session started".
+            if (!replyText) {
+                 replyText = "Session started. (Waiting for Jules to act...)";
+            }
+
+        // Case 3: No Session & No Pending -> Start New Flow
+        } else {
+            console.log(`No active session for channel ${channelId}. Listing sources.`);
             
             // 1. List Sources
             const sourcesData = await listSources();
@@ -244,49 +305,33 @@ client.on('messageCreate', async (message) => {
                 return;
             }
 
-            // 2. Pick first source (User can be more specific in v2)
-            const source = sourcesData.sources[0];
-            console.log(`Selected source: ${source.name}`);
+            const sources = sourcesData.sources;
+            
+            // Store state and ask user
+            pendingSourceSelections.set(channelId, { sources: sources, originalPrompt: content });
 
-            // 3. Create Session
-            // Use the user's message as the initial prompt
-            const sessionData = await createSessionFull(source, content);
-            console.log("Session Created:", JSON.stringify(sessionData));
+            let listMsg = "**Select a source to start a session:**\n";
+            sources.forEach((s, index) => {
+                // Simple name parsing: sources/github/user/repo -> user/repo
+                // or just show the full name or generic ID
+                const displayName = s.githubRepo ? `${s.githubRepo.owner}/${s.githubRepo.repo}` : s.name;
+                listMsg += `${index + 1}. ${displayName}\n`;
+            });
+            listMsg += "\nReply with the number.";
             
-            sessionId = sessionData.name; // "sessions/..."
-            if (!sessionId) {
-                throw new Error("Session ID is missing in response: " + JSON.stringify(sessionData));
-            }
-            activeSessions.set(channelId, sessionId);
-            
-            // Now send the actual user message
-            await sendMessageToSession(sessionId, content);
-            
-            // Poll for response
-            replyText = await waitForAgentResponse(sessionId, channelId);
-
-        } else {
-            // Existing session
-            console.log(`Using existing session ${sessionId}`);
-            try {
-                await sendMessageToSession(sessionId, content);
-                replyText = await waitForAgentResponse(sessionId, channelId);
-            } catch (err) {
-                 if (err.message.includes('404')) {
-                    console.log("Session 404, clearing and retrying...");
-                    activeSessions.delete(channelId);
-                    await message.reply("Previous session expired. Starting a new one...");
-                    return;
-                }
-                throw err;
-            }
+            await message.reply(listMsg);
+            return; // Wait for next user message
         }
 
         if (replyText) {
             await message.reply(replyText);
         } else {
-            await message.channel.send("Jules is thinking... (Response timed out, check back later)");
+             // Only if we expected a reply and got none (time out)
+             if (sessionId && !pendingSelection) { // logic complex here, simplified check
+                 await message.channel.send("Jules is thinking... (Response timed out, check back later)");
+             }
         }
+
 
     } catch (err) {
         console.error("Handler Error:", err);
