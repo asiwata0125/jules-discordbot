@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const express = require('express');
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -105,7 +105,8 @@ async function createSessionFull(source, userPrompt) {
                 source: source.name,
                 githubRepoContext: source.githubRepo ? { startingBranch: "main" } : undefined
             },
-            automationMode: "AUTO_CREATE_PR", 
+            automationMode: "AUTO_CREATE_PR",
+            requirePlanApproval: true
         })
     });
     if (!response.ok) {
@@ -131,46 +132,99 @@ async function sendMessageToSession(sessionId, prompt) {
     return await response.json();
 }
 
+async function approveSessionPlan(sessionId) {
+    const response = await fetch(`https://jules.googleapis.com/v1alpha/${sessionId}:approvePlan`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Goog-Api-Key': JULES_API_KEY
+        },
+        body: JSON.stringify({})
+    });
+    if (!response.ok) {
+         const errText = await response.text();
+         throw new Error(`ApprovePlan Failed: ${errText}`);
+    }
+    return await response.json();
+}
+
 function formatActivity(activity) {
     if (!activity) return null;
     
+    let content = "";
+    const files = [];
+    let type = 'unknown';
+
     // 1. Plan Generated
-    if (activity.planGenerated && activity.planGenerated.plan && activity.planGenerated.plan.steps) {
-        const steps = activity.planGenerated.plan.steps.map(s => `${s.index ? s.index + '. ' : ''}${s.title}`).join('\n');
-        return `I have created a plan:\n${steps}`;
+    if (activity.planGenerated && activity.planGenerated.plan) {
+        type = 'planGenerated';
+        if (activity.planGenerated.plan.steps) {
+            const steps = activity.planGenerated.plan.steps.map(s => `${s.index ? s.index + '. ' : ''}${s.title}`).join('\n');
+            content = `I have created a plan:\n${steps}`;
+        }
     }
 
     // 2. Progress Updated
-    if (activity.progressUpdated) {
+    else if (activity.progressUpdated) {
+        type = 'progressUpdated';
         const title = activity.progressUpdated.title;
         const description = activity.progressUpdated.description;
-        if (title && description && title !== description) {
-            return `Update: ${title}\n${description}`;
+
+        content = `Update: ${title || "Progress update"}`;
+        if (description && description !== title) {
+            content += `\n${description}`;
         }
-        return `Update: ${title || description}`;
     }
 
     // 3. Outputs (Pull Request)
-    if (activity.outputs) {
+    else if (activity.outputs) {
+        type = 'outputs';
         const pr = activity.outputs.find(o => o.pullRequest);
         if (pr) {
-            return `I have created a Pull Request: ${pr.pullRequest.url}\n${pr.pullRequest.title}`;
+            content = `I have created a Pull Request: ${pr.pullRequest.url}\n${pr.pullRequest.title}`;
         }
     }
 
     // 4. Session Completed
-    if (activity.sessionCompleted) {
-        return "Task completed.";
+    else if (activity.sessionCompleted) {
+        type = 'sessionCompleted';
+        content = "Task completed.";
     }
 
-    return null;
+    // Process Artifacts
+    if (activity.artifacts) {
+        for (const artifact of activity.artifacts) {
+            if (artifact.bashOutput) {
+                const cmd = artifact.bashOutput.command || "";
+                const out = artifact.bashOutput.output || "";
+                if (cmd || out) {
+                     content += `\n\`\`\`bash\n${cmd}\n${out}\n\`\`\``;
+                }
+            }
+            if (artifact.media && artifact.media.data) {
+                try {
+                    const buffer = Buffer.from(artifact.media.data, 'base64');
+                    files.push({
+                        attachment: buffer,
+                        name: `screenshot.${artifact.media.mimeType === 'image/png' ? 'png' : 'jpg'}`
+                    });
+                    content += "\n(Look! I took a screenshot!)";
+                } catch (e) {
+                    console.error("Failed to process media artifact", e);
+                }
+            }
+        }
+    }
+
+    if (!content && files.length === 0) return null;
+
+    return { content, files, type };
 }
 
 async function monitorSession(sessionId, channel, initialSeenIds = null) {
     console.log(`Monitoring session ${sessionId}...`);
     let seenIds = new Set(initialSeenIds || []);
 
-    // If no initial seen set, we must fetch everything currently there to avoid re-printing history.
     if (!initialSeenIds) {
         let pageToken = null;
         do {
@@ -186,49 +240,54 @@ async function monitorSession(sessionId, channel, initialSeenIds = null) {
     const startTime = Date.now();
 
     while (Date.now() - startTime < maxTime) {
-        await new Promise(r => setTimeout(r, 4000)); // Poll every 4 seconds
+        await new Promise(r => setTimeout(r, 4000));
 
-        // Poll: We assume we want to see new stuff.
-        // Ideally we should use pageToken from previous run, but "new" activities might appear in previous pages?
-        // Safest strategy for polling without specific API support: fetch first page(s).
-        // Since we track seenIds, we can filter duplicates.
-        // We'll fetch the first 100 to be safe.
-        
-        const data = await listActivities(sessionId); // Default first page
+        const data = await listActivities(sessionId);
         if (!data || !data.activities) continue;
 
-        // Process new activities
         const newActivities = data.activities.filter(a => !seenIds.has(a.id));
-
-        // Sort by createTime if possible to send in order?
-        // Assuming API returns chronological or we just process list order.
 
         for (const activity of newActivities) {
             seenIds.add(activity.id);
 
-            // Skip 'thinking' or internal states if needed, but 'formatActivity' filters mostly.
-            // Also skip user messages to avoid echoing.
             if (activity.originator === 'user') continue;
 
-            const text = formatActivity(activity);
-            if (text) {
-                console.log(`Found activity: ${text}`);
-                const japaneseText = await translateToJapanesePersona(text);
-                await channel.send(japaneseText);
+            const result = formatActivity(activity);
+            if (result) {
+                console.log(`Found activity: ${result.content}`);
+
+                let textToSend = result.content;
+                if (textToSend) {
+                     textToSend = await translateToJapanesePersona(textToSend);
+                }
+
+                const payload = { content: textToSend || "..." };
+                if (result.files.length > 0) {
+                    payload.files = result.files;
+                }
+
+                // If planGenerated, add Approve Button
+                if (result.type === 'planGenerated') {
+                    const confirm = new ButtonBuilder()
+			            .setCustomId(`approve_plan:${sessionId}`)
+			            .setLabel('Approve Plan')
+			            .setStyle(ButtonStyle.Success);
+
+		            const row = new ActionRowBuilder()
+			            .addComponents(confirm);
+
+                    payload.components = [row];
+                }
+
+                if (textToSend || result.files.length > 0) {
+                     await channel.send(payload);
+                }
 
                 if (activity.sessionCompleted) {
-                    return; // Stop monitoring if done
+                    return;
                 }
             }
         }
-
-        // Check if there are more pages that might have new info?
-        // Usually new activities are appended. If strict pagination is used, they might be on the last page.
-        // But most APIs put new stuff on first page or last page.
-        // If chronological: new stuff is at the end.
-        // If reverse chronological: new stuff is at the beginning.
-        // Without knowing, fetching ALL pages every 4s is too heavy.
-        // We increased pageSize to 100 below.
     }
 }
 
@@ -241,7 +300,6 @@ async function listActivities(sessionId, pageToken = null) {
         method: 'GET',
         headers: { 'X-Goog-Api-Key': JULES_API_KEY }
     });
-    // ignore 404
     if (!response.ok) return null;
     return await response.json();
 }
@@ -263,7 +321,18 @@ async function translateToJapanesePersona(text) {
     if (!text) return text;
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-        const prompt = `Translate the following text to Japanese. The speaker is a slightly timid but honest boy (ちょっとおどおどしてるけど素直な男の子). Use this persona for the translation. Output only the translation:\n\n${text}`;
+        const prompt = `Translate the following text to Japanese. The speaker is a slightly timid but honest boy (ちょっとおどおどしてるけど素直な男の子).
+
+        Rules:
+        1. Keep the persona consistent.
+        2. Do NOT translate code blocks (content inside \`\`\`) or URLs.
+        3. Keep technical terms (like "npm install", "Pull Request", "React") in English or Katakana as appropriate for a developer chat.
+        4. If the text is a log output, keep it mostly as is, just add a timid comment at the start.
+        5. If the text mentions "I took a screenshot", say something cute like "スクショ撮ってみたよ！".
+
+        Text to translate:
+        \n\n${text}`;
+
         const result = await model.generateContent(prompt);
         return result.response.text().trim();
     } catch (e) {
@@ -273,10 +342,8 @@ async function translateToJapanesePersona(text) {
 }
 
 async function identifySourceWithGemini(userMessage, sources) {
-    // User requested latest model.
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     
-    // Create a simplified list of sources for the prompt
     const sourcesList = sources.map((s, i) => `${i}. ${s.name} (Repo: ${s.githubRepo?.owner}/${s.githubRepo?.name})`).join('\n');
 
     const prompt = `
@@ -316,15 +383,12 @@ async function identifySourceWithGemini(userMessage, sources) {
 // --- Express Server & Interactions ---
 const app = express();
 
-// Middleware: Parse JSON and verify Discord signature
-// Middleware: Parse JSON and capture raw body
 app.use(express.json({
     verify: (req, res, buf) => {
         req.rawBody = buf;
     }
 }));
 
-// Async Middleware for Discord Verification
 async function verifyDiscordRequest(req, res, next) {
     const signature = req.get('X-Signature-Ed25519');
     const timestamp = req.get('X-Signature-Timestamp');
@@ -334,13 +398,10 @@ async function verifyDiscordRequest(req, res, next) {
     }
 
     try {
-        // Handle both Sync and Async verifyKey implementations
         let isValidRequest = verifyKey(req.rawBody, signature, timestamp, DISCORD_PUBLIC_KEY);
         if (isValidRequest instanceof Promise) {
             isValidRequest = await isValidRequest;
         }
-
-        console.log("Signature Verification Result (Resolved):", isValidRequest);
 
         if (!isValidRequest) {
             return res.status(401).send('Bad Request Signature');
@@ -352,16 +413,44 @@ async function verifyDiscordRequest(req, res, next) {
     next();
 }
 
-// Interaction Endpoint (Slash Commands)
-// Handle both /interactions and /interactions/ to avoid 301 redirects which Discord hates
 app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, res) => {
     const message = req.body;
-    console.log("Interaction received. Type:", message.type, "Name:", message.data ? message.data.name : "N/A");
+    console.log("Interaction received. Type:", message.type);
 
     if (message.type === InteractionType.PING) {
-        console.log("Handling PING. Sending PONG.");
         res.setHeader('Content-Type', 'application/json');
         return res.status(200).send(JSON.stringify({ type: 1 }));
+    }
+
+    // Handle Button Clicks (Message Component)
+    if (message.type === 3) { // InteractionType.MESSAGE_COMPONENT
+        const customId = message.data.custom_id;
+        if (customId && customId.startsWith('approve_plan:')) {
+            const sessionId = customId.split(':')[1];
+            console.log(`Approving plan for session ${sessionId}`);
+            try {
+                // Determine source for localized message? Persona is Japanese.
+                await approveSessionPlan(sessionId);
+
+                res.json({
+                    type: InteractionResponseType.UPDATE_MESSAGE,
+                    data: {
+                        content: `${message.message.content}\n\n✅ **Plan Approved!** (プランを承認したよ！作業始めるね)`,
+                        components: [] // Remove buttons
+                    }
+                });
+            } catch (e) {
+                console.error("Approval failed", e);
+                res.json({
+                    type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                    data: {
+                        content: `ごめんね、エラーが出ちゃった...: ${e.message}`,
+                        flags: 64
+                    }
+                });
+            }
+            return;
+        }
     }
 
     if (message.type === InteractionType.APPLICATION_COMMAND) {
@@ -371,7 +460,6 @@ app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, 
             console.log("Received /wake command");
             const channelId = message.channel_id;
 
-            // Reply should use res.json for clarity, though res.send works
             res.json({
                 type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
                 data: {
@@ -381,11 +469,7 @@ app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, 
             
             GoogleCloudManager.setMinInstances(1).catch(console.error);
 
-            // Connect Gateway
             if (!client.isReady()) {
-                console.log("Logging in to Discord Gateway...");
-                
-                // Notify when actually ready
                 const onReady = async () => {
                    try {
                        const channel = await client.channels.fetch(channelId);
@@ -403,11 +487,7 @@ app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, 
                     client.off('ready', onReady);
                 });
             } else {
-                 // If already ready, maybe send a follow up immediately? 
-                 // Or just assume the user knows.
-                 // Ideally use followUp via interaction token, but standard message is fine if we have channelId.
                  try {
-                     // Wait a bit to let the first message appear
                      setTimeout(async () => {
                         const channel = await client.channels.fetch(channelId);
                         if (channel) await channel.send("✨ もう起きてるよ！お話しよう。");
@@ -423,13 +503,11 @@ app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, 
                 type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
                 data: {
                     content: '😴 寝るね... おやすみぃ！',
-                    flags: 64 // Ephemeral
+                    flags: 64
                 }
             });
 
-            // Disconnect Gateway
             if (client.isReady()) {
-                 console.log("Destroying client connection...");
                  client.destroy();
             }
 
@@ -437,11 +515,10 @@ app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, 
             return;
         }
     }
-    console.log("Unknown interaction type");
+
     res.status(400).send("Unknown Type");
 });
 
-// Health Check
 app.get('/', (req, res) => {
     res.send({ status: 'running', bot_ready: client.isReady() });
 });
@@ -450,7 +527,6 @@ app.listen(PORT, () => {
     console.log(`Express server running on port ${PORT}`);
 });
 
-// Message Handling
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
 
@@ -466,18 +542,14 @@ client.on('messageCreate', async (message) => {
     await message.channel.sendTyping();
 
     try {
-        // Translate user input to English for internal logic
         const englishContent = await translateToEnglish(content);
         console.log(`Original: "${content}", Translated: "${englishContent}"`);
 
         let sessionId = activeSessions.get(channelId);
-        let replyText = "";
 
-        // Case 1: Active Session exists
         if (sessionId) {
             console.log(`Using existing session ${sessionId}`);
             try {
-                // Fetch ALL existing activities to build a seen set
                 let seenIds = new Set();
                 let pageToken = null;
                 do {
@@ -489,8 +561,6 @@ client.on('messageCreate', async (message) => {
                 } while (pageToken);
 
                 await sendMessageToSession(sessionId, englishContent);
-
-                // Start monitoring (fire and forget for this request handler, but loop will run)
                 monitorSession(sessionId, message.channel, seenIds).catch(console.error);
 
             } catch (err) {
@@ -503,11 +573,9 @@ client.on('messageCreate', async (message) => {
                 throw err;
             }
 
-        // Case 2: No Session -> Use Gemini
         } else {
             console.log(`No active session. engaging Gemini for setup.`);
             
-            // 1. List Sources
             const sourcesData = await listSources();
             if (!sourcesData.sources || sourcesData.sources.length === 0) {
                 await message.reply("Julesのアカウントにソースが見つからないよ... 先にソースを繋いでほしいな。");
@@ -516,7 +584,6 @@ client.on('messageCreate', async (message) => {
 
             const sources = sourcesData.sources;
             
-            // 2. Ask Gemini (using English content for better source matching)
             const decision = await identifySourceWithGemini(englishContent, sources);
 
             if (decision.matchIndex !== null && decision.matchIndex >= 0 && decision.matchIndex < sources.length) {
@@ -529,7 +596,6 @@ client.on('messageCreate', async (message) => {
                 if (!sessionId) throw new Error("Session creation failed.");
                 activeSessions.set(channelId, sessionId);
 
-                // Start monitoring new session
                 monitorSession(sessionId, message.channel).catch(console.error);
                 
             } else {
