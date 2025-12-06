@@ -239,8 +239,10 @@ app.use(express.json({
 // Interaction Endpoint (Slash Commands)
 app.post('/interactions', async (req, res) => {
     const message = req.body;
+    console.log("Interaction received. Type:", message.type, "Name:", message.data ? message.data.name : "N/A");
 
     if (message.type === InteractionType.PING) {
+        console.log("Handling PING. Sending PONG.");
         return res.send({ type: InteractionResponseType.PONG });
     }
 
@@ -280,6 +282,7 @@ app.post('/interactions', async (req, res) => {
             return;
         }
     }
+    console.log("Unknown interaction type");
 });
 
 // Health Check
