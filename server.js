@@ -131,40 +131,113 @@ async function sendMessageToSession(sessionId, prompt) {
     return await response.json();
 }
 
-async function waitForAgentResponse(sessionId, channelId) {
-    // Polling usually logic would be here. For simplicity, we just list activities once or twice.
-    // In a real prod bot, use a better queuing system or longer polling loop.
-    console.log(`Polling activities for ${sessionId}...`);
+function formatActivity(activity) {
+    if (!activity) return null;
     
-    // Simple naive delay loop
-    for (let i = 0; i < 20; i++) { // Try for ~40-60 seconds
-        await new Promise(r => setTimeout(r, 3000));
-        
-        const activities = await listActivities(sessionId);
-        if (activities && activities.activities) {
-            // Find recent message from AGENT
-            // Sorting to find latest
-             // Logic simplified: Just grab the latest planGenerated or content that seems like a reply.
-             // For conversational bot, we assume the last entry from 'agent' is the reply.
-             // This is tricky without robust state tracking of what we already saw.
-             
-             // Hack: Just get the last activity.
-             const last = activities.activities[activities.activities.length - 1];
-             if (last.originator === 'agent' && last.type !== 'thinking' ) { 
-                 // Assuming 'thinking' isn't the final type, actual text usually in other fields or just inferred.
-                 // The API structure varies, assuming we print summary or something.
-                 // Adapting to previous known logic or simplifed.
-                 
-                 // Let's assume we return a generic "Check PR" or specific text if available.
-                 return "Jules replied! (Check Cloud Console for details or assume task started)."; 
-             }
+    // 1. Plan Generated
+    if (activity.planGenerated && activity.planGenerated.plan && activity.planGenerated.plan.steps) {
+        const steps = activity.planGenerated.plan.steps.map(s => `${s.index ? s.index + '. ' : ''}${s.title}`).join('\n');
+        return `I have created a plan:\n${steps}`;
+    }
+
+    // 2. Progress Updated
+    if (activity.progressUpdated) {
+        const title = activity.progressUpdated.title;
+        const description = activity.progressUpdated.description;
+        if (title && description && title !== description) {
+            return `Update: ${title}\n${description}`;
+        }
+        return `Update: ${title || description}`;
+    }
+
+    // 3. Outputs (Pull Request)
+    if (activity.outputs) {
+        const pr = activity.outputs.find(o => o.pullRequest);
+        if (pr) {
+            return `I have created a Pull Request: ${pr.pullRequest.url}\n${pr.pullRequest.title}`;
         }
     }
-    return null; // Timeout
+
+    // 4. Session Completed
+    if (activity.sessionCompleted) {
+        return "Task completed.";
+    }
+
+    return null;
 }
 
-async function listActivities(sessionId) {
-     const response = await fetch(`https://jules.googleapis.com/v1alpha/${sessionId}/activities`, {
+async function monitorSession(sessionId, channel, initialSeenIds = null) {
+    console.log(`Monitoring session ${sessionId}...`);
+    let seenIds = new Set(initialSeenIds || []);
+
+    // If no initial seen set, we must fetch everything currently there to avoid re-printing history.
+    if (!initialSeenIds) {
+        let pageToken = null;
+        do {
+            const data = await listActivities(sessionId, pageToken);
+            if (data && data.activities) {
+                data.activities.forEach(a => seenIds.add(a.id));
+            }
+            pageToken = data ? data.nextPageToken : null;
+        } while (pageToken);
+    }
+
+    const maxTime = 120000; // Monitor for 2 minutes max per user interaction
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < maxTime) {
+        await new Promise(r => setTimeout(r, 4000)); // Poll every 4 seconds
+
+        // Poll: We assume we want to see new stuff.
+        // Ideally we should use pageToken from previous run, but "new" activities might appear in previous pages?
+        // Safest strategy for polling without specific API support: fetch first page(s).
+        // Since we track seenIds, we can filter duplicates.
+        // We'll fetch the first 100 to be safe.
+        
+        const data = await listActivities(sessionId); // Default first page
+        if (!data || !data.activities) continue;
+
+        // Process new activities
+        const newActivities = data.activities.filter(a => !seenIds.has(a.id));
+
+        // Sort by createTime if possible to send in order?
+        // Assuming API returns chronological or we just process list order.
+
+        for (const activity of newActivities) {
+            seenIds.add(activity.id);
+
+            // Skip 'thinking' or internal states if needed, but 'formatActivity' filters mostly.
+            // Also skip user messages to avoid echoing.
+            if (activity.originator === 'user') continue;
+
+            const text = formatActivity(activity);
+            if (text) {
+                console.log(`Found activity: ${text}`);
+                const japaneseText = await translateToJapanesePersona(text);
+                await channel.send(japaneseText);
+
+                if (activity.sessionCompleted) {
+                    return; // Stop monitoring if done
+                }
+            }
+        }
+
+        // Check if there are more pages that might have new info?
+        // Usually new activities are appended. If strict pagination is used, they might be on the last page.
+        // But most APIs put new stuff on first page or last page.
+        // If chronological: new stuff is at the end.
+        // If reverse chronological: new stuff is at the beginning.
+        // Without knowing, fetching ALL pages every 4s is too heavy.
+        // We increased pageSize to 100 below.
+    }
+}
+
+async function listActivities(sessionId, pageToken = null) {
+    let url = `https://jules.googleapis.com/v1alpha/${sessionId}/activities?pageSize=100`;
+    if (pageToken) {
+        url += `&pageToken=${pageToken}`;
+    }
+    const response = await fetch(url, {
         method: 'GET',
         headers: { 'X-Goog-Api-Key': JULES_API_KEY }
     });
@@ -404,8 +477,22 @@ client.on('messageCreate', async (message) => {
         if (sessionId) {
             console.log(`Using existing session ${sessionId}`);
             try {
+                // Fetch ALL existing activities to build a seen set
+                let seenIds = new Set();
+                let pageToken = null;
+                do {
+                    const data = await listActivities(sessionId, pageToken);
+                    if (data && data.activities) {
+                        data.activities.forEach(a => seenIds.add(a.id));
+                    }
+                    pageToken = data ? data.nextPageToken : null;
+                } while (pageToken);
+
                 await sendMessageToSession(sessionId, englishContent);
-                replyText = await waitForAgentResponse(sessionId, channelId);
+
+                // Start monitoring (fire and forget for this request handler, but loop will run)
+                monitorSession(sessionId, message.channel, seenIds).catch(console.error);
+
             } catch (err) {
                  if (err.message.includes('404')) {
                     console.log("Session 404, clearing and retrying...");
@@ -442,22 +529,13 @@ client.on('messageCreate', async (message) => {
                 if (!sessionId) throw new Error("Session creation failed.");
                 activeSessions.set(channelId, sessionId);
 
-                replyText = await waitForAgentResponse(sessionId, channelId);
-                if (!replyText) replyText = "Session started. Ready to help!";
+                // Start monitoring new session
+                monitorSession(sessionId, message.channel).catch(console.error);
                 
             } else {
                 await message.reply(decision.reply || "どのリポジトリにする？");
                 return; 
             }
-        }
-
-        if (replyText) {
-            const japaneseReply = await translateToJapanesePersona(replyText);
-            await message.reply(japaneseReply);
-        } else {
-             if (sessionId) {
-                 await message.channel.send("Julesが考えてるみたい... (ちょっと時間かかってるかも、あとで確認してみてね)");
-             }
         }
 
     } catch (err) {
