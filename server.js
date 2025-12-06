@@ -214,33 +214,44 @@ async function identifySourceWithGemini(userMessage, sources) {
 const app = express();
 
 // Middleware: Parse JSON and verify Discord signature
+// Middleware: Parse JSON and capture raw body
 app.use(express.json({
     verify: (req, res, buf) => {
-        const signature = req.get('X-Signature-Ed25519');
-        const timestamp = req.get('X-Signature-Timestamp');
-        
-        // Debug Logging
-        if (signature) {
-             console.log(`Verifying signature. Key length: ${DISCORD_PUBLIC_KEY ? DISCORD_PUBLIC_KEY.length : 'missing'}`);
-             console.log(`Signature: ${signature.substring(0, 10)}... Timestamp: ${timestamp}`);
-        }
-
-        if (signature && timestamp) {
-            const isValidRequest = verifyKey(buf, signature, timestamp, DISCORD_PUBLIC_KEY);
-            console.log("Signature Verification Result:", isValidRequest);
-
-            if (!isValidRequest) {
-               console.error("Signature verification failed.");
-               res.status(401).send('Bad Request Signature');
-               throw new Error('Bad Request Signature');
-            }
-        }
+        req.rawBody = buf;
     }
 }));
 
+// Async Middleware for Discord Verification
+async function verifyDiscordRequest(req, res, next) {
+    const signature = req.get('X-Signature-Ed25519');
+    const timestamp = req.get('X-Signature-Timestamp');
+
+    if (!signature || !timestamp) {
+        return res.status(401).send('Missing Discord headers');
+    }
+
+    try {
+        // Handle both Sync and Async verifyKey implementations
+        let isValidRequest = verifyKey(req.rawBody, signature, timestamp, DISCORD_PUBLIC_KEY);
+        if (isValidRequest instanceof Promise) {
+            isValidRequest = await isValidRequest;
+        }
+
+        console.log("Signature Verification Result (Resolved):", isValidRequest);
+
+        if (!isValidRequest) {
+            return res.status(401).send('Bad Request Signature');
+        }
+    } catch (err) {
+        console.error("Verification Error:", err);
+        return res.status(401).send('Verification Internal Error');
+    }
+    next();
+}
+
 // Interaction Endpoint (Slash Commands)
 // Handle both /interactions and /interactions/ to avoid 301 redirects which Discord hates
-app.post(['/interactions', '/interactions/'], async (req, res) => {
+app.post(['/interactions', '/interactions/'], verifyDiscordRequest, async (req, res) => {
     const message = req.body;
     console.log("Interaction received. Type:", message.type, "Name:", message.data ? message.data.name : "N/A");
 
