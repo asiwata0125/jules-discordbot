@@ -239,7 +239,8 @@ app.use(express.json({
 }));
 
 // Interaction Endpoint (Slash Commands)
-app.post('/interactions', async (req, res) => {
+// Handle both /interactions and /interactions/ to avoid 301 redirects which Discord hates
+app.post(['/interactions', '/interactions/'], async (req, res) => {
     const message = req.body;
     console.log("Interaction received. Type:", message.type, "Name:", message.data ? message.data.name : "N/A");
 
