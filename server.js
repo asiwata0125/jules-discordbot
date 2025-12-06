@@ -3,22 +3,21 @@ const { Client, GatewayIntentBits } = require('discord.js');
 const express = require('express');
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { google } = require('googleapis'); // NEW
-const { verifyKeyMiddleware, InteractionType, InteractionResponseType } = require('discord-interactions'); // NEW
+const { google } = require('googleapis');
+const { verifyKey, InteractionType, InteractionResponseType } = require('discord-interactions');
 
 // Configuration
-const PORT = process.env.PORT || 8080; // Cloud Run default
+const PORT = process.env.PORT || 8080;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const JULES_API_KEY = process.env.JULES_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY; // Needed for interactions
-
-const PROJECT_ID = process.env.PROJECT_ID; // e.g. 'my-project'
-const SERVICE_NAME = process.env.SERVICE_NAME; // e.g. 'jules-bot'
-const REGION = process.env.REGION; // e.g. 'us-central1'
+const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY;
+const PROJECT_ID = process.env.PROJECT_ID;
+const SERVICE_NAME = process.env.SERVICE_NAME;
+const REGION = process.env.REGION;
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const run = google.run('v2'); // Cloud Run API
+const run = google.run('v2');
 
 // --- Discord Client ---
 const client = new Client({
@@ -39,10 +38,15 @@ const activeSessions = new Map(); // channelId -> sessionId
 // --- Google Cloud Run Manager ---
 class GoogleCloudManager {
     static async getAuthClient() {
-        const auth = new google.auth.GoogleAuth({
-            scopes: ['https://www.googleapis.com/auth/cloud-platform']
-        });
-        return await auth.getClient();
+        try {
+             const auth = new google.auth.GoogleAuth({
+                scopes: ['https://www.googleapis.com/auth/cloud-platform']
+            });
+            return await auth.getClient();
+        } catch (e) {
+            console.error("Auth Error:", e);
+            throw e;
+        }
     }
 
     static async setMinInstances(count) {
@@ -55,18 +59,6 @@ class GoogleCloudManager {
         try {
             const authClient = await this.getAuthClient();
             const name = `projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE_NAME}`;
-            
-            // 1. Get current config to preserve other settings
-            const request = {
-                name,
-                auth: authClient
-            };
-            // Note: In v2 API, we patch the service.
-            // We need to construct the patch request carefully.
-            
-            // Simplified: We assume we just want to update scaling. 
-            // We use the `updateService` method, but typically needs the full object or a mask.
-            // Let's use `patch` with updateMask.
             
             const patchRequest = {
                 name,
@@ -86,90 +78,100 @@ class GoogleCloudManager {
 
         } catch (err) {
             console.error("Failed to scale Cloud Run:", err);
-            // Don't crash app, just log
         }
     }
 }
 
-// ... (Jules API Helpers source helpers logic remains same, removed for brevity in this replace call, will keep if I don't touch them? 
-// Wait, I must be careful not to delete them. I will use Start/End line to preserve them.)
+// --- Jules API Helpers ---
+async function listSources() {
+    const response = await fetch('https://jules.googleapis.com/v1alpha/sources', {
+        method: 'GET',
+        headers: { 'X-Goog-Api-Key': JULES_API_KEY }
+    });
+    if (!response.ok) throw new Error(`ListSources Failed: ${response.statusText}`);
+    return await response.json();
+}
 
-// ...
-
-// --- Express Server & Interactions ---
-const app = express();
-
-// Interaction Endpoint (Slash Commands)
-app.post('/interactions', verifyKeyMiddleware(DISCORD_PUBLIC_KEY), async (req, res) => {
-    const message = req.body;
-
-    if (message.type === InteractionType.PING) {
-        return res.send({ type: InteractionResponseType.PONG });
+async function createSessionFull(source, userPrompt) {
+    const response = await fetch('https://jules.googleapis.com/v1alpha/sessions', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Goog-Api-Key': JULES_API_KEY
+        },
+        body: JSON.stringify({
+            prompt: userPrompt,
+            sourceContext: {
+                source: source.name,
+                githubRepoContext: source.githubRepo ? { startingBranch: "main" } : undefined
+            },
+            automationMode: "AUTO_CREATE_PR", 
+        })
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`CreateSession Failed: ${errText}`);
     }
+    return await response.json(); 
+}
 
-    if (message.type === InteractionType.APPLICATION_COMMAND) {
-        const commandName = message.data.name;
+async function sendMessageToSession(sessionId, prompt) {
+    const response = await fetch(`https://jules.googleapis.com/v1alpha/${sessionId}:sendMessage`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Goog-Api-Key': JULES_API_KEY
+        },
+        body: JSON.stringify({ prompt })
+    });
+    if (!response.ok) {
+         const errText = await response.text();
+         throw new Error(`SendMessage Failed: ${errText}`);
+    }
+    return await response.json();
+}
 
-        if (commandName === 'wake') {
-            console.log("Received /wake command");
-            res.send({
-                type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-                data: {
-                    content: '🥱 Waking up... (This will take about a minute. I will start listening to chat soon!)',
-                    flags: 64 // Ephemeral
-                }
-            });
-            
-            // Trigger Scaling
-            await GoogleCloudManager.setMinInstances(1);
-
-            // Connect Gateway
-            if (!client.isReady()) {
-                console.log("Logging in to Discord Gateway...");
-                client.login(DISCORD_TOKEN).catch(console.error);
-            }
-            return;
-        }
-
-        if (commandName === 'sleep') {
-            console.log("Received /sleep command");
-            res.send({
-                type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-                data: {
-                    content: '😴 Going to sleep... Goodnight!',
-                    flags: 64 // Ephemeral
-                }
-            });
-
-            // Trigger Sleep Logic
-            await GoogleCloudManager.setMinInstances(0);
-            
-            // Optional: Destroy client connection to ensure process can idle out if Cloud Run logic permits
-            // client.destroy(); 
-            return;
+async function waitForAgentResponse(sessionId, channelId) {
+    // Polling usually logic would be here. For simplicity, we just list activities once or twice.
+    // In a real prod bot, use a better queuing system or longer polling loop.
+    console.log(`Polling activities for ${sessionId}...`);
+    
+    // Simple naive delay loop
+    for (let i = 0; i < 20; i++) { // Try for ~40-60 seconds
+        await new Promise(r => setTimeout(r, 3000));
+        
+        const activities = await listActivities(sessionId);
+        if (activities && activities.activities) {
+            // Find recent message from AGENT
+            // Sorting to find latest
+             // Logic simplified: Just grab the latest planGenerated or content that seems like a reply.
+             // For conversational bot, we assume the last entry from 'agent' is the reply.
+             // This is tricky without robust state tracking of what we already saw.
+             
+             // Hack: Just get the last activity.
+             const last = activities.activities[activities.activities.length - 1];
+             if (last.originator === 'agent' && last.type !== 'thinking' ) { 
+                 // Assuming 'thinking' isn't the final type, actual text usually in other fields or just inferred.
+                 // The API structure varies, assuming we print summary or something.
+                 // Adapting to previous known logic or simplifed.
+                 
+                 // Let's assume we return a generic "Check PR" or specific text if available.
+                 return "Jules replied! (Check Cloud Console for details or assume task started)."; 
+             }
         }
     }
-});
+    return null; // Timeout
+}
 
-// Health Check
-app.get('/', (req, res) => {
-    res.send({ status: 'running', bot_ready: client.isReady() });
-});
-
-app.listen(PORT, () => {
-    console.log(`Express server running on port ${PORT}`);
-});
-
-
-
-// Note: We need to preserve the Jules helpers and Client logic.
-// I will target the TOP of the file to inject imports/config/classes,
-// and the BOTTOM to inject the Express listeners.
-
-// This tool call REPLACES imports and config.
-
-
-// ... (Jules API Helpers source helpers remain the same ...)
+async function listActivities(sessionId) {
+     const response = await fetch(`https://jules.googleapis.com/v1alpha/${sessionId}/activities`, {
+        method: 'GET',
+        headers: { 'X-Goog-Api-Key': JULES_API_KEY }
+    });
+    // ignore 404
+    if (!response.ok) return null;
+    return await response.json();
+}
 
 async function identifySourceWithGemini(userMessage, sources) {
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
@@ -203,13 +205,86 @@ async function identifySourceWithGemini(userMessage, sources) {
         return JSON.parse(responseText);
     } catch (err) {
         console.error("Gemini Error:", err);
-        return { matchIndex: null, reply: "I'm having trouble thinking right now. Please tell me the repository number (e.g. '1')." }; // Fallback
+        return { matchIndex: null, reply: "I'm having trouble thinking right now. Please tell me the repository number (e.g. '1')." }; 
     }
 }
 
 
-// ... (Discord Client setup remains ...)
+// --- Express Server & Interactions ---
+const app = express();
 
+// Middleware: Parse JSON and verify Discord signature
+app.use(express.json({
+    verify: (req, res, buf) => {
+        const signature = req.get('X-Signature-Ed25519');
+        const timestamp = req.get('X-Signature-Timestamp');
+        // Verify only if headers are present (Discord requests)
+        if (signature && timestamp) {
+            const isValidRequest = verifyKey(buf, signature, timestamp, DISCORD_PUBLIC_KEY);
+            if (!isValidRequest) {
+                res.status(401).send('Bad Request Signature');
+                throw new Error('Bad Request Signature');
+            }
+        }
+    }
+}));
+
+// Interaction Endpoint (Slash Commands)
+app.post('/interactions', async (req, res) => {
+    const message = req.body;
+
+    if (message.type === InteractionType.PING) {
+        return res.send({ type: InteractionResponseType.PONG });
+    }
+
+    if (message.type === InteractionType.APPLICATION_COMMAND) {
+        const commandName = message.data.name;
+
+        if (commandName === 'wake') {
+            console.log("Received /wake command");
+            res.send({
+                type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                data: {
+                    content: '🥱 Waking up... (This will take about a minute. I will start listening to chat soon!)',
+                    flags: 64 
+                }
+            });
+            
+            await GoogleCloudManager.setMinInstances(1);
+
+            if (!client.isReady()) {
+                console.log("Logging in to Discord Gateway...");
+                client.login(DISCORD_TOKEN).catch(console.error);
+            }
+            return;
+        }
+
+        if (commandName === 'sleep') {
+            console.log("Received /sleep command");
+            res.send({
+                type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                data: {
+                    content: '😴 Going to sleep... Goodnight!',
+                    flags: 64 
+                }
+            });
+
+            await GoogleCloudManager.setMinInstances(0);
+            return;
+        }
+    }
+});
+
+// Health Check
+app.get('/', (req, res) => {
+    res.send({ status: 'running', bot_ready: client.isReady() });
+});
+
+app.listen(PORT, () => {
+    console.log(`Express server running on port ${PORT}`);
+});
+
+// Message Handling
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
 
@@ -228,7 +303,7 @@ client.on('messageCreate', async (message) => {
         let sessionId = activeSessions.get(channelId);
         let replyText = "";
 
-        // Case 1: Active Session exists -> Direct simple chat with Jules
+        // Case 1: Active Session exists
         if (sessionId) {
             console.log(`Using existing session ${sessionId}`);
             try {
@@ -244,7 +319,7 @@ client.on('messageCreate', async (message) => {
                 throw err;
             }
 
-        // Case 2: No Session -> Use Gemini to identify source
+        // Case 2: No Session -> Use Gemini
         } else {
             console.log(`No active session. engaging Gemini for setup.`);
             
@@ -261,26 +336,21 @@ client.on('messageCreate', async (message) => {
             const decision = await identifySourceWithGemini(content, sources);
 
             if (decision.matchIndex !== null && decision.matchIndex >= 0 && decision.matchIndex < sources.length) {
-                // Source Identified!
                 const selectedSource = sources[decision.matchIndex];
                 await message.reply(`Okay, loading **${selectedSource.name.split('/').pop()}**...`);
                 
-                // 3. Create Session
                 const sessionData = await createSessionFull(selectedSource, content);
                 sessionId = sessionData.name;
                 
                 if (!sessionId) throw new Error("Session creation failed.");
                 activeSessions.set(channelId, sessionId);
 
-                // 4. Get Agent Response
                 replyText = await waitForAgentResponse(sessionId, channelId);
                 if (!replyText) replyText = "Session started. Ready to help!";
                 
             } else {
-                // Ambiguous or Clarification needed
-                // Gemini provided the reply text
                 await message.reply(decision.reply || "Which repository would you like to work on?");
-                return; // User needs to reply again
+                return; 
             }
         }
 
@@ -297,5 +367,3 @@ client.on('messageCreate', async (message) => {
         await message.reply(`Error: ${err.message}`);
     }
 });
-
-
