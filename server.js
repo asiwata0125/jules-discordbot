@@ -218,10 +218,17 @@ app.use(express.json({
     verify: (req, res, buf) => {
         const signature = req.get('X-Signature-Ed25519');
         const timestamp = req.get('X-Signature-Timestamp');
-        // Verify only if headers are present (Discord requests)
+        
+        // Debug Logging
+        if (signature) {
+             console.log(`Verifying signature. Key length: ${DISCORD_PUBLIC_KEY ? DISCORD_PUBLIC_KEY.length : 'missing'}`);
+             console.log(`Signature: ${signature.substring(0, 10)}... Timestamp: ${timestamp}`);
+        }
+
         if (signature && timestamp) {
             const isValidRequest = verifyKey(buf, signature, timestamp, DISCORD_PUBLIC_KEY);
             if (!isValidRequest) {
+                console.error("Signature verification failed.");
                 res.status(401).send('Bad Request Signature');
                 throw new Error('Bad Request Signature');
             }
