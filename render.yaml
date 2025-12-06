@@ -2,10 +2,16 @@ services:
   - type: web
     name: jules-discord-bot
     env: node
+services:
+  - type: web
+    name: jules-discord-bot
+    env: node
     buildCommand: npm install
     startCommand: node server.js
     envVars:
       - key: DISCORD_TOKEN
         sync: false
       - key: JULES_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
         sync: false
