@@ -236,7 +236,7 @@ async function monitorSession(sessionId, channel, initialSeenIds = null) {
         } while (pageToken);
     }
 
-    const maxTime = 120000; // Monitor for 2 minutes max per user interaction
+    const maxTime = 600000; // Monitor for 10 minutes max per user interaction
     const startTime = Date.now();
 
     while (Date.now() - startTime < maxTime) {
