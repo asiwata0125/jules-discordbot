@@ -221,6 +221,17 @@ function formatActivity(activity) {
     return { content, files, type };
 }
 
+const MUTTER_PHRASES = [
+    "ふむふむ...",
+    "ちょっと待ってね、考えてる...",
+    "えっと、それは...",
+    "難しそうだなぁ...",
+    "一生懸命やってるよ！",
+    "もうちょっとで分かりそう...",
+    "今コードを読んでるよ...",
+    "どうすればいいかなぁ..."
+];
+
 async function monitorSession(sessionId, channel, initialSeenIds = null) {
     console.log(`Monitoring session ${sessionId}...`);
     let seenIds = new Set(initialSeenIds || []);
@@ -239,13 +250,36 @@ async function monitorSession(sessionId, channel, initialSeenIds = null) {
     const maxTime = 600000; // Monitor for 10 minutes max per user interaction
     const startTime = Date.now();
 
+    let lastMutterTime = Date.now();
+    let isWaitingForResponse = true;
+
     while (Date.now() - startTime < maxTime) {
         await new Promise(r => setTimeout(r, 4000));
 
         const data = await listActivities(sessionId);
-        if (!data || !data.activities) continue;
+        if (!data || !data.activities) {
+            // Mutter logic if no activity
+             if (isWaitingForResponse && (Date.now() - lastMutterTime > 30000)) {
+                const phrase = MUTTER_PHRASES[Math.floor(Math.random() * MUTTER_PHRASES.length)];
+                await channel.send(phrase);
+                lastMutterTime = Date.now();
+            }
+            continue;
+        }
 
         const newActivities = data.activities.filter(a => !seenIds.has(a.id));
+
+        if (newActivities.length > 0) {
+            // Found real activity, reset mutter timer
+            lastMutterTime = Date.now();
+        } else {
+             // No NEW activity, but activity list wasn't empty. Same mutter logic.
+             if (isWaitingForResponse && (Date.now() - lastMutterTime > 30000)) {
+                const phrase = MUTTER_PHRASES[Math.floor(Math.random() * MUTTER_PHRASES.length)];
+                await channel.send(phrase);
+                lastMutterTime = Date.now();
+            }
+        }
 
         for (const activity of newActivities) {
             seenIds.add(activity.id);
@@ -255,6 +289,17 @@ async function monitorSession(sessionId, channel, initialSeenIds = null) {
             const result = formatActivity(activity);
             if (result) {
                 console.log(`Found activity: ${result.content}`);
+
+                // Update waiting state based on activity type
+                if (result.type === 'planGenerated') {
+                    isWaitingForResponse = false; // Waiting for user approval
+                } else if (result.type === 'outputs') {
+                    isWaitingForResponse = false; // Likely done
+                } else if (result.type === 'progressUpdated') {
+                    isWaitingForResponse = true; // Still working
+                } else if (result.type === 'sessionCompleted') {
+                    return;
+                }
 
                 let textToSend = result.content;
                 if (textToSend) {
@@ -281,10 +326,6 @@ async function monitorSession(sessionId, channel, initialSeenIds = null) {
 
                 if (textToSend || result.files.length > 0) {
                      await channel.send(payload);
-                }
-
-                if (activity.sessionCompleted) {
-                    return;
                 }
             }
         }
